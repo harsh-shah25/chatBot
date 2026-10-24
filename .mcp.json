@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "upstash-kv": {
+      "command": "D:/chatBot/tools/kv_mcp/.venv/Scripts/python.exe",
+      "args": ["D:/chatBot/tools/kv_mcp/server.py"]
+    }
+  }
+}

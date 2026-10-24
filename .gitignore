@@ -5,3 +5,4 @@ __pycache__/
 .vercel
 .env*
 !.env.example
+.venv/

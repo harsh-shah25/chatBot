@@ -135,7 +135,7 @@ def normalize_context(raw: object) -> dict:
 
 
 FRESH_PATTERN = re.compile(
-    r"\b(latest|current|today|this year|20(?:2[4-9]|3\d)|deadline|date|admission|application|eligibility|entrance|exam|college|university|course|fee|tuition|scholarship|job market|jobs?|vacanc\w*|salar(?:y|ies)|placement|ranking|cut.?off|notification|syllabus|government|rule|requirement|apply|available|opening)\b",
+    r"\b(latest|current|today|this year|20(?:2[4-9]|3\d)|deadline|date)\b",
     re.IGNORECASE,
 )
 

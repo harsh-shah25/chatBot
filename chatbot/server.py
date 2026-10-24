@@ -57,6 +57,9 @@ class Config:
         redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
         if bool(redis_url) != bool(redis_token):
             raise ValueError("Set both Upstash credentials or leave both empty")
+        if os.getenv("VERCEL") and not redis_url:
+            # Serverless instances do not share memory, so follow-up messages would expire.
+            raise ValueError("Upstash credentials are required on Vercel")
         return cls(
             port=int(os.getenv("PORT", "3001")),
             allowed_origins=frozenset(s.strip() for s in required("ALLOWED_ORIGINS").split(",") if s.strip()),
@@ -137,6 +140,82 @@ class ChatService:
         return self.provider.chunks(response), sources, search_used
 
 
+def json_response(status: int, body: dict):
+    data = json.dumps(body).encode("utf-8")
+    return status, [("Content-Type", "application/json; charset=utf-8"),
+                    ("Content-Length", str(len(data))), ("Cache-Control", "no-store")], [data]
+
+
+def sse_event(name: str, data: dict) -> bytes:
+    return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def stream_events(service: ChatService, chunks, sources, search_used, request_id, started):
+    """Yield SSE frames. Closing this generator (client disconnect) closes the model stream."""
+    try:
+        if sources:
+            yield sse_event("sources", {"items": sources})
+        for text in chunks:
+            yield sse_event("delta", {"text": text})
+        yield sse_event("done", {"finish_reason": "stop"})
+        LOG.info("request_id=%s status=200 provider=%s search=%s elapsed_ms=%d",
+                 request_id, service.config.llm_provider, search_used,
+                 int((time.monotonic() - started) * 1000))
+    except ChatError as error:
+        LOG.info("request_id=%s status=stream_error error=%s", request_id, error.code)
+        yield sse_event("error", {"code": error.code, "message": str(error)})
+    except Exception:
+        LOG.error("request_id=%s status=stream_error error=stream_error", request_id)
+        yield sse_event("error", {"code": "stream_error", "message": "The reply stopped unexpectedly."})
+    finally:
+        close = getattr(chunks, "close", None)
+        if close:
+            close()
+
+
+def handle(service: ChatService, method: str, path: str, header, read):
+    """Transport-neutral routing shared by the stdlib server and the WSGI app.
+
+    Returns (status, headers, body), where body is an iterable of bytes."""
+    if method == "GET" and path == "/health":
+        return json_response(200, {"ok": True})
+    if method != "POST" or path != "/chat/messages":
+        return json_response(404, {"error": {"code": "not_found", "message": "No such endpoint."}})
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    try:
+        origin = header("Origin")
+        if origin and origin not in service.config.allowed_origins:
+            raise ChatError(403, "origin_forbidden", "This origin is not allowed.")
+        content_type = (header("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ChatError(400, "invalid_content_type", "Send application/json.")
+        cookie = get_session_cookie(header("Cookie"))
+        if not cookie:
+            raise ChatError(401, "unauthenticated", "Please log in.")
+        try:
+            length = int(header("Content-Length") or "-1")
+        except ValueError:
+            length = -1
+        if length < 1 or length > 32768:
+            raise ChatError(400, "invalid_request", "Request body must be at most 32 KB.")
+        try:
+            body = json.loads(read(length))
+        except (ValueError, UnicodeDecodeError):
+            raise ChatError(400, "invalid_json", "Request body is not valid JSON.") from None
+        chunks, sources, search_used = service.prepare(cookie, body)
+    except ChatError as error:
+        LOG.info("request_id=%s status=%s error=%s elapsed_ms=%d", request_id, error.status,
+                 error.code, int((time.monotonic() - started) * 1000))
+        return json_response(error.status, {"error": {"code": error.code, "message": str(error)}})
+    except Exception:
+        LOG.error("request_id=%s status=500 error=server_error", request_id)
+        return json_response(500, {"error": {"code": "server_error", "message": "Please try again."}})
+    headers = [("Content-Type", "text/event-stream; charset=utf-8"),
+               ("Cache-Control", "no-store, no-transform"), ("X-Accel-Buffering", "no")]
+    return 200, headers, stream_events(service, chunks, sources, search_used, request_id, started)
+
+
 def make_handler(service: ChatService):
     class Handler(BaseHTTPRequestHandler):
         server_version = "CareerChat/0.1"
@@ -145,92 +224,25 @@ def make_handler(service: ChatService):
             # BaseHTTPRequestHandler normally logs the URL. Keep logs metadata-only.
             pass
 
-        def _json(self, status: int, body: dict):
-            data = json.dumps(body).encode("utf-8")
+        def _respond(self):
+            status, headers, body = handle(service, self.command, self.path,
+                                           self.headers.get, self.rfile.read)
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
-
-        def _event(self, name: str, data: dict):
-            payload = f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-            self.wfile.write(payload.encode("utf-8"))
-            self.wfile.flush()
-
-        def do_GET(self):
-            if self.path == "/health":
-                self._json(200, {"ok": True})
-            else:
-                self._json(404, {"error": {"code": "not_found", "message": "No such endpoint."}})
-
-        def do_POST(self):
-            if self.path != "/chat/messages":
-                self._json(404, {"error": {"code": "not_found", "message": "No such endpoint."}})
-                return
-            request_id = uuid.uuid4().hex
-            started = time.monotonic()
-            search_used = False
-            try:
-                origin = self.headers.get("Origin")
-                if origin and origin not in service.config.allowed_origins:
-                    raise ChatError(403, "origin_forbidden", "This origin is not allowed.")
-                if self.headers.get_content_type() != "application/json":
-                    raise ChatError(400, "invalid_content_type", "Send application/json.")
-                cookie = get_session_cookie(self.headers.get("Cookie"))
-                if not cookie:
-                    raise ChatError(401, "unauthenticated", "Please log in.")
-                try:
-                    length = int(self.headers.get("Content-Length", "-1"))
-                except ValueError:
-                    length = -1
-                if length < 1 or length > 32768:
-                    raise ChatError(400, "invalid_request", "Request body must be at most 32 KB.")
-                try:
-                    body = json.loads(self.rfile.read(length))
-                except (ValueError, UnicodeDecodeError):
-                    raise ChatError(400, "invalid_json", "Request body is not valid JSON.") from None
-                chunks, sources, search_used = service.prepare(cookie, body)
-            except ChatError as error:
-                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
-                LOG.info("request_id=%s status=%s error=%s elapsed_ms=%d", request_id, error.status,
-                         error.code, int((time.monotonic() - started) * 1000))
-                return
-            except Exception:
-                self._json(500, {"error": {"code": "server_error", "message": "Please try again."}})
-                LOG.error("request_id=%s status=500 error=server_error", request_id)
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-store, no-transform")
-            self.send_header("X-Accel-Buffering", "no")
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             try:
-                if sources:
-                    self._event("sources", {"items": sources})
-                for text in chunks:
-                    self._event("delta", {"text": text})
-                self._event("done", {"finish_reason": "stop"})
-                LOG.info("request_id=%s status=200 provider=%s search=%s elapsed_ms=%d",
-                         request_id, service.config.llm_provider, search_used,
-                         int((time.monotonic() - started) * 1000))
+                for data in body:
+                    self.wfile.write(data)
+                    self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                close = getattr(chunks, "close", None)
+                pass
+            finally:
+                close = getattr(body, "close", None)
                 if close:
                     close()
-            except ChatError as error:
-                try:
-                    self._event("error", {"code": error.code, "message": str(error)})
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                LOG.info("request_id=%s status=stream_error error=%s", request_id, error.code)
-            except Exception:
-                try:
-                    self._event("error", {"code": "stream_error", "message": "The reply stopped unexpectedly."})
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                LOG.error("request_id=%s status=stream_error error=stream_error", request_id)
+
+        do_GET = do_POST = _respond
 
     return Handler
 

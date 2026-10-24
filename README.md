@@ -12,6 +12,10 @@ To verify the live profile endpoint before configuring Redis or search, set `CAR
 
 You can also build the included Dockerfile for a container host that supports long-lived HTTP responses. Point `CAREER_API_BASE_URL` to the deployed `careerAPI`; configure the frontend's first-party `/chat/*` proxy to forward the `careerai_session` cookie to this service. `ALLOWED_ORIGINS` is a comma-separated list of browser origins permitted to POST; a trusted proxy may omit `Origin`.
 
+## Deploy on Vercel
+
+`pyproject.toml` points Vercel at the WSGI app in `chatbot/wsgi.py`, which serves the same routes as `chatbot.server`. Import the repository with the Python preset, root directory `./`, and the default build and install settings. Add the environment variables from `.env.example` in the project settings; `PORT` is not used. Upstash is required on Vercel because serverless instances do not share memory; without it the service returns `server_misconfigured` and logs the reason. Configuration is read on the first request, so redeploy after changing variables. Point the frontend's `/chat/*` proxy at the deployment URL so the `careerai_session` cookie is forwarded.
+
 ## External contracts
 
 - On the first message, `GET /me` with the forwarded student cookie supplies the authenticated student's email, and `GET /me/access` confirms paid access. The frontend does not supply an email for profile selection.

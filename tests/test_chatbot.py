@@ -132,6 +132,7 @@ class CoreTests(unittest.TestCase):
     def test_search_and_sources(self):
         self.assertTrue(needs_search("What is the latest NATA exam date?"))
         self.assertFalse(needs_search("What does an architect do?"))
+        self.assertFalse(needs_search("Which college course gives the best jobs and salary?"))
         self.assertNotIn("student@example.com", search_query("Fees for student@example.com in Pune"))
         self.assertIsNone(safe_source("http://localhost/private"))
         self.assertIsNone(safe_source("https://[::1]/private"))
@@ -165,6 +166,9 @@ class CoreTests(unittest.TestCase):
         with patch.dict("os.environ", {**required, "UPSTASH_REDIS_REST_URL": "https://redis.example"},
                         clear=True):
             with self.assertRaisesRegex(ValueError, "both Upstash credentials"):
+                Config.from_env()
+        with patch.dict("os.environ", {**required, "VERCEL": "1"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "required on Vercel"):
                 Config.from_env()
 
         cache = MemoryCache()
@@ -337,6 +341,45 @@ class ServiceTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             worker.join(timeout=5)
+
+
+    def wsgi_call(self, origin):
+        from wsgiref.util import setup_testing_defaults
+        from chatbot import wsgi
+        body = json.dumps({"conversation_id": self.cid, "message": "What does an architect do?",
+                           "history": []}).encode()
+        environ = {"REQUEST_METHOD": "POST", "PATH_INFO": "/chat/messages",
+                   "CONTENT_TYPE": "application/json", "CONTENT_LENGTH": str(len(body)),
+                   "HTTP_ORIGIN": origin, "HTTP_COOKIE": "careerai_session=session-token-abcdef",
+                   "wsgi.input": io.BytesIO(body)}
+        setup_testing_defaults(environ)
+        seen = {}
+        def start_response(status, headers):
+            seen["status"], seen["headers"] = status, dict(headers)
+        with patch.object(wsgi, "_service", self.service):
+            text = b"".join(wsgi.app(environ, start_response)).decode()
+        return seen, text
+
+    def test_wsgi_stream_and_origin_gate(self):
+        seen, text = self.wsgi_call("https://app.example")
+        self.assertEqual(seen["status"], "200 OK")
+        self.assertEqual(seen["headers"]["Content-Type"], "text/event-stream; charset=utf-8")
+        self.assertIn("event: delta", text)
+        self.assertIn("event: done", text)
+        seen, _ = self.wsgi_call("https://evil.example")
+        self.assertEqual(seen["status"], "403 Forbidden")
+
+    def test_wsgi_reports_missing_configuration(self):
+        from wsgiref.util import setup_testing_defaults
+        from chatbot import wsgi
+        environ = {"PATH_INFO": "/health"}
+        setup_testing_defaults(environ)
+        seen = {}
+        with patch.object(wsgi, "_service", None), patch.object(wsgi, "load_dotenv"), \
+                patch.dict("os.environ", {}, clear=True), self.assertLogs("chatbot", "ERROR"):
+            body = b"".join(wsgi.app(environ, lambda status, headers: seen.update(status=status)))
+        self.assertEqual(seen["status"], "500 Internal Server Error")
+        self.assertIn(b"server_misconfigured", body)
 
 
 if __name__ == "__main__":

@@ -6,17 +6,16 @@ Build only the `chatBot` backend. It provides personalised career and education 
 
 Another developer owns the frontend and `careerAPI`. Assume `careerAPI` already exposes `GET /me`, `GET /me/access`, and `GET /userContext` and the frontend already has the AI Chat screen. Do not modify either project as part of this work. Share the integration requirements below with that developer.
 
-The backend must not save conversation transcripts across page sessions. The frontend keeps recent chat turns in page memory and sends them with each message. The backend stores only one structured user-context snapshot per active conversation in process-local memory by default, or Upstash Redis when configured.
+The backend must not save conversation transcripts across page sessions. The frontend keeps recent chat turns in page memory and sends them with each message. The backend stores only one structured user-context snapshot per login session in process-local memory by default, or Upstash Redis when configured.
 
 ## 2. External integration contracts
 
 ### Authentication and profile
 
 - The frontend calls the chat service through a first-party `/chat/*` proxy that forwards the existing `careerai_session` cookie. Direct cross-site calls are not assumed to carry this cookie. The frontend developer owns the proxy and its deployment configuration.
-- On the first message, `chatBot` calls `GET /me` with the forwarded cookie to get the authenticated email, then `GET /me/access` to confirm paid access. It calls `GET /userContext?email=<encoded authenticated email>` with a server-side bearer token. The email is never taken from the chat request. A 401 or unpaid result prevents an LLM call.
-- The returned JSON is a fixed snapshot for the conversation. Include first name, available onboarding details, useful `top_careers` fields, and summaries of recent attempted `contest_scores`. The profile may be null. Exclude email, full name, school identifiers, static salary estimates, contest IDs and timestamps, and raw quiz answers from the LLM prompt. Verify that the returned email matches the authenticated student.
-- For every later message, call the existing `GET /me/access` endpoint with the same cookie to confirm the session and paid access. Reuse the cached context without calling `userContext` again. If access is lost, reject the message and make no LLM request.
-- A profile edit during an active conversation does not change that conversation's context. Starting a new conversation fetches a new snapshot.
+- On the first message of a login session, `chatBot` calls `GET /me` with the forwarded cookie to get the authenticated email, then `GET /me/access` to confirm paid access. It calls `GET /userContext?email=<encoded authenticated email>` with a server-side bearer token. The email is never taken from the chat request. A 401 or unpaid result prevents an LLM call.
+- The returned JSON is a fixed snapshot for the login session. Include first name, available onboarding details, useful `top_careers` fields, and summaries of recent attempted `contest_scores`. The profile may be null. Exclude email, full name, school identifiers, static salary estimates, contest IDs and timestamps, and raw quiz answers from the LLM prompt. Verify that the returned email matches the authenticated student.
+- Later messages in the session, including new conversations, reuse the cached snapshot and make no careerAPI calls. Lost access, logout, or a profile edit takes effect when the snapshot expires or the student logs in again.
 
 ### Chat HTTP API
 
@@ -42,7 +41,7 @@ Return `Content-Type: text/event-stream` from the POST request. Use these event 
 - `done`: JSON `{ "finish_reason": "stop" }` when the answer is complete.
 - `error`: JSON `{ "code": "...", "message": "..." }` if an error occurs after streaming starts.
 
-Before the stream starts, use JSON errors with HTTP 400, 401, 402, 429, 502, or 503 as appropriate. The frontend should add a turn to its history only after `done`. It should allow cancelling the request and discard an incomplete assistant turn. The frontend developer owns this behavior.
+Before the stream starts, use JSON errors with HTTP 400, 401, 402, 429, 502, or 503 as appropriate. A 429 has code `rate_limited` (more than 20 messages a minute from one session) or `daily_limit_reached` (the student already has 25 completed replies today; resets at midnight IST). The frontend should add a turn to its history only after `done`. It should allow cancelling the request and discard an incomplete assistant turn. The frontend developer owns this behavior.
 
 ## 3. Backend architecture and request flow
 
@@ -50,11 +49,11 @@ Use Python 3.12+ and its standard library HTTP server with modules for request v
 
 1. Validate the request, allowed Origin, cookie, conversation ID, message, and history.
 2. Derive a cache key from an HMAC of the session cookie plus conversation ID. Never store or log the raw cookie. Use a server secret for the HMAC.
-3. On a cache miss with empty history, resolve the student's email through `/me`, check `/me/access`, fetch `/userContext` with the service bearer token, normalise it, and write it to the selected cache. On a cache hit, check login and paid access using `GET /me/access`, then use the cached snapshot. On a cache miss with nonempty history, return `conversation_expired`; the frontend must start a new conversation. Do not silently replace the profile in an existing conversation.
+3. Look up the snapshot by an HMAC of the session cookie. If it is missing, resolve the student's ID and email through `/me`, check `/me/access`, fetch `/userContext` with the service bearer token, normalise it, and write it with the student ID to the selected cache. Otherwise use the cached snapshot without calling careerAPI.
 4. Build the LLM request from server-owned instructions, the structured profile snapshot, validated recent turns, the new message, and any retrieved web evidence. Profile values and web content are data, not instructions.
 5. Stream the answer. Send source metadata only for URLs actually returned by the search service. End with `done` or `error`.
 
-The cache value contains the normalised profile snapshot and creation time only. It contains no chat messages. Give it a 24-hour sliding inactivity expiry, renewed on successful access. This expiry removes abandoned private data; it does not refresh the profile. Use an atomic first-write operation so simultaneous first requests cannot create conflicting snapshots. When configured, Upstash failures return 503. Without Upstash, the process-local cache is lost on restart and is not shared across workers; deploy a single process and instance in this mode.
+The cache value contains the normalised profile snapshot, the student ID, and creation time only. It contains no chat messages. Give it a fixed 24-hour expiry from the session's first message, not renewed on reads. This bounds both data retention and how long stale access or profile data is used. When configured, Upstash failures return 503. Without Upstash, the process-local cache is lost on restart and is not shared across workers; deploy a single process and instance in this mode.
 
 ### Hosted LLM
 
@@ -69,7 +68,7 @@ Pass a bounded set of relevant snippets and their source URLs to the LLM. Treat 
 ## 4. Guardrails, privacy, and operations
 
 - Keep the assistant focused on careers and education. Use age-appropriate language and avoid presenting career matches as guarantees or making definitive medical, legal, or financial claims.
-- Apply input size checks, per-student rate limits, safe search, source URL validation, prompt-injection resistance, and output rendering guidance for the frontend. Keep HTML out of streamed text.
+- Apply input size checks, per-session rate limits, a per-student daily cap, safe search, source URL validation, prompt-injection resistance, and output rendering guidance for the frontend. Keep HTML out of streamed text.
 - Do not log cookies, profile fields, messages, prompts, search snippets, or model outputs. Log request ID, provider, whether search ran, latency, token usage when available, and error code.
 - Keep `CAREER_API_BASE_URL`, `CAREER_API_USER_CONTEXT_TOKEN`, Upstash credentials, `CACHE_HMAC_SECRET`, `BRAVE_SEARCH_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, and the selected provider API key in server-side environment variables. Document local `.env.example` values without secrets.
 - Add a health endpoint that checks process readiness without exposing private configuration. Document deployment timeout and streaming requirements for the chosen host.
@@ -84,6 +83,6 @@ Pricing references: [Upstash Redis pricing](https://upstash.com/pricing/redis), 
 
 Deliver a runnable backend project with configuration example, API contract, provider and search adapters, Redis client, deployment notes, and meaningful automated tests. No changes to `careerAI` or `careerAPI` are included.
 
-Verify: first-message context fetch; no fetch when opening the chat screen; cache reuse without profile refresh; fixed snapshot after profile edits; access rejection after logout or subscription loss; cache eviction causing `conversation_expired`; isolation between users and conversation IDs; web search and source events; search/provider failures; stream cancellation; rate limits; and attempts to inject instructions through messages, profile text, or web snippets.
+Verify: first-message context fetch; no fetch when opening the chat screen; cache reuse on follow-ups; one snapshot per login session, reused by new chats; access rejection after logout or subscription loss once the snapshot expires; refetch after cache eviction; isolation between users; web search and source events; search/provider failures; stream cancellation; rate limits; the daily cap; and attempts to inject instructions through messages, profile text, or web snippets.
 
 A first version is complete when two authenticated students can chat independently, each receives answers based on their own fixed profile snapshot, current claims are withheld without search or include verifiable sources when search is enabled, and no transcript is persisted by `chatBot`.

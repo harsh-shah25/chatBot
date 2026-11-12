@@ -59,9 +59,15 @@ def get_session_cookie(header: str | None) -> str | None:
         return None
 
 
-def context_key(secret: str, cookie: str, conversation_id: str) -> str:
-    digest = hmac.new(secret.encode(), f"{cookie}\0{conversation_id}".encode(), hashlib.sha256).hexdigest()
+def context_key(secret: str, cookie: str) -> str:
+    digest = hmac.new(secret.encode(), f"session\0{cookie}".encode(), hashlib.sha256).hexdigest()
     return f"chat:context:{digest}"
+
+
+def daily_key(secret: str, student_id: str, timestamp: float) -> str:
+    digest = hmac.new(secret.encode(), f"student\0{student_id}".encode(), hashlib.sha256).hexdigest()
+    # Day buckets roll over at midnight IST (UTC+05:30), where the students are.
+    return f"chat:daily:{digest}:{int((timestamp + 19800) // 86400)}"
 
 
 def rate_key(secret: str, cookie: str, timestamp: float) -> str:

@@ -11,8 +11,7 @@ Chat messages will remain in browser memory for the current page session. Reload
 ```mermaid
 flowchart LR
     UI[careerAI chat UI] -->|POST /chat/messages| Bot[chatBot backend]
-    Bot -->|First message: GET /me, /me/access, /userContext| API[careerAPI]
-    Bot -->|Later messages: check access| API
+    Bot -->|First message of a session: GET /me, /me/access, /userContext| API[careerAPI]
     Bot <--> Cache[(In-memory cache or Upstash Redis)]
     Bot -.->|When configured| Search[Web search API]
     Bot --> LLM[Configured hosted LLM]
@@ -21,9 +20,9 @@ flowchart LR
 
 `chatBot` uses the student's forwarded session cookie to call `GET /me` and `GET /me/access`. It obtains the authenticated email from `/me`, then calls `GET /userContext?email=<encoded email>` with a server-side bearer token. It checks that the returned email matches. The response may include a null profile, root-level career matches, and contest scores. Only guidance data enters the LLM context; email, full name, static salary estimates, contest IDs, and timestamps stay out.
 
-On the **first user message**, `chatBot` will fetch `userContext` and store that snapshot in the selected cache: **process-local memory by default**, or a separate managed Upstash Redis service when configured. The cache key will be tied to the authenticated student session and a browser-generated conversation ID. Upstash is optional; the profile will not be stored in the frontend.
+On the **first message of each login session**, `chatBot` fetches `userContext` and stores that snapshot in the selected cache: **process-local memory by default**, or a separate managed Upstash Redis service when configured. The cache key is an HMAC of the session cookie, so each login session has **one snapshot**, however many chats it opens. Upstash is optional; the profile will not be stored in the frontend.
 
-The profile snapshot will **remain unchanged throughout that chat**. An inactivity expiry will remove abandoned snapshots to limit data retention; activity will renew it. This expiry is for cleanup, not profile freshness. If a snapshot disappears, the UI will start a new chat rather than silently change the context of an existing one. Later messages will check that the student is still logged in and has paid access, without fetching `userContext` again.
+The snapshot is **frozen for the session**: later messages, including new chats, make no careerAPI calls. A changed profile (for example, after a quiz retake), lost paid access, or logout takes effect when the snapshot's fixed 24-hour expiry passes or the student starts a new login session. If a snapshot disappears, the next message fetches it again.
 
 The browser will send bounded recent chat turns with each request. `chatBot` will not store transcripts in either cache. A server setting will select one hosted LLM provider and model from Groq, Gemini, or Omniroute.
 
@@ -35,6 +34,6 @@ The structured student profile comes directly from `careerAPI`. It does **not** 
 
 ## Guardrails and verification
 
-The backend will validate input size, rate limit requests, enforce timeouts, and treat chat history, profile text, and web results as untrusted data. The UI will safely render streamed text and validate source links. If search is unconfigured or fails, the assistant will say it could not verify current facts. The in-memory cache requires a single running process and loses snapshots on restart.
+The backend will validate input size, rate limit requests, cap each student at 25 completed replies per day, enforce timeouts, and treat chat history, profile text, and web results as untrusted data. The UI will safely render streamed text and validate source links. If search is unconfigured or fails, the assistant will say it could not verify current facts. The in-memory cache requires a single running process and loses snapshots on restart.
 
-Verification will cover first-message context loading, reuse of the fixed snapshot, inactivity cleanup, lost login or paid access, web citations, streaming failures, and Clear Chat.
+Verification will cover first-message context loading, reuse of the fixed snapshot, snapshot expiry, lost login or paid access after expiry, web citations, streaming failures, and Clear Chat.

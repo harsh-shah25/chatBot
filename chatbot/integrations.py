@@ -51,16 +51,22 @@ class CareerApi:
             raise ChatError(502, "invalid_context", "careerAPI returned invalid data.")
         return result
 
-    def context(self, cookie: str) -> dict:
+    def student(self, cookie: str) -> dict:
+        """The logged-in student's id and email, from GET /me."""
         student = self._get("me", cookie=cookie).get("student")
-        email = student.get("email") if isinstance(student, dict) else None
-        if not isinstance(email, str) or not email.strip():
+        student = student if isinstance(student, dict) else {}
+        email = student.get("email")
+        if student.get("id") is None or not isinstance(email, str) or not email.strip():
             raise ChatError(502, "invalid_student", "Could not identify your account.")
+        return {"id": str(student["id"]), "email": email}
+
+    def context(self, cookie: str) -> dict:
+        email = self.student(cookie)["email"]
         self.check_access(cookie)
         return self.context_by_email(email)
 
     def context_by_email(self, email: str) -> dict:
-        """Service-only lookup; the public chat path must use context(cookie)."""
+        """Service-only lookup; pass only an email that came from the caller's own /me."""
         if not isinstance(email, str) or not email.strip():
             raise ChatError(400, "invalid_email", "An email is required for this check.")
         path = "userContext?" + urlencode({"email": email.strip()})
@@ -81,10 +87,12 @@ class MemoryCache:
 
     PROFILE_TTL = 86400
     RATE_TTL = 120
+    USAGE_TTL = 172800
 
     def __init__(self):
         self._profiles = {}
         self._rates = {}
+        self._usage = {}
         self._lock = threading.Lock()
 
     def get(self, key: str) -> dict | None:
@@ -98,26 +106,9 @@ class MemoryCache:
                 return None
             return value
 
-    def put_first(self, key: str, value: dict) -> bool:
+    def put(self, key: str, value: dict) -> None:
         with self._lock:
-            now = time.monotonic()
-            entry = self._profiles.get(key)
-            if entry is not None and entry[1] > now:
-                return False
-            self._profiles[key] = (value, now + self.PROFILE_TTL)
-            return True
-
-    def renew(self, key: str) -> bool:
-        with self._lock:
-            entry = self._profiles.get(key)
-            now = time.monotonic()
-            if entry is None:
-                return False
-            if entry[1] <= now:
-                del self._profiles[key]
-                return False
-            self._profiles[key] = (entry[0], now + self.PROFILE_TTL)
-            return True
+            self._profiles[key] = (value, time.monotonic() + self.PROFILE_TTL)
 
     def rate(self, key: str) -> int:
         with self._lock:
@@ -132,25 +123,55 @@ class MemoryCache:
                 self._rates = {k: v for k, v in self._rates.items() if v[1] > now}
             return count
 
+    def usage(self, key: str) -> int:
+        with self._lock:
+            count, expires_at = self._usage.get(key, (0, 0))
+            return count if expires_at > time.monotonic() else 0
+
+    def add_usage(self, key: str) -> None:
+        with self._lock:
+            now = time.monotonic()
+            count, expires_at = self._usage.get(key, (0, 0))
+            if expires_at <= now:
+                count, expires_at = 0, now + self.USAGE_TTL
+            self._usage[key] = (count + 1, expires_at)
+            # Daily keys rotate at midnight; drop finished days as they accumulate.
+            if len(self._usage) > 1000:
+                self._usage = {k: v for k, v in self._usage.items() if v[1] > now}
+
 
 class UpstashCache:
     def __init__(self, url: str, token: str):
         self.url = url.rstrip("/")
         self.token = token
 
-    def command(self, *parts) -> object:
+    def _post(self, url: str, body: list) -> object:
         try:
-            response = json_request(self.url, method="POST",
-                                    headers={"Authorization": f"Bearer {self.token}",
-                                             "Content-Type": "application/json"},
-                                    body=list(parts), timeout=5)
+            return json_request(url, method="POST",
+                                headers={"Authorization": f"Bearer {self.token}",
+                                         "Content-Type": "application/json"},
+                                body=body, timeout=5)
         except (HTTPError, ChatError) as error:
             raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.") from error
+
+    @staticmethod
+    def _result(response: object) -> object:
         if not isinstance(response, dict) or response.get("error"):
             raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
         return response.get("result")
 
+    def command(self, *parts) -> object:
+        return self._result(self._post(self.url, list(parts)))
+
+    def pipeline(self, *commands: list) -> list:
+        """Run several commands in one HTTP round trip."""
+        responses = self._post(self.url + "/pipeline", list(commands))
+        if not isinstance(responses, list) or len(responses) != len(commands):
+            raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
+        return [self._result(response) for response in responses]
+
     def get(self, key: str) -> dict | None:
+        # Plain GET: the expiry is fixed from the session's first message, not renewed.
         value = self.command("GET", key)
         if value is None:
             return None
@@ -162,17 +183,19 @@ class UpstashCache:
             pass
         raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
 
-    def put_first(self, key: str, value: dict) -> bool:
-        return self.command("SET", key, json.dumps(value, ensure_ascii=False), "NX", "EX", 86400) == "OK"
-
-    def renew(self, key: str) -> bool:
-        return self.command("EXPIRE", key, 86400) == 1
+    def put(self, key: str, value: dict) -> None:
+        self.command("SET", key, json.dumps(value, ensure_ascii=False), "EX", 86400)
 
     def rate(self, key: str) -> int:
-        count = int(self.command("INCR", key))
-        if count == 1:
-            self.command("EXPIRE", key, 120)
-        return count
+        count, _ = self.pipeline(["INCR", key], ["EXPIRE", key, 120, "NX"])
+        return int(count)
+
+    def usage(self, key: str) -> int:
+        return int(self.command("GET", key) or 0)
+
+    def add_usage(self, key: str) -> None:
+        # Two days, so a key first written just before midnight outlives its own day.
+        self.pipeline(["INCR", key], ["EXPIRE", key, 172800, "NX"])
 
 
 class BraveSearch:

@@ -7,11 +7,12 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import (ChatError, context_key, get_session_cookie, needs_search,
+from .core import (ChatError, context_key, daily_key, get_session_cookie, needs_search,
                    normalize_context, rate_key, system_prompt, validate_message)
 from .integrations import BraveSearch, CareerApi, MemoryCache, UpstashCache
 from .providers import HostedProvider
@@ -20,6 +21,7 @@ from .providers import HostedProvider
 LOG = logging.getLogger("chatbot")
 NO_CURRENT_FACTS = ("I couldn't verify current information right now. Please check an official "
                     "college, exam, or government source and try again later.")
+DAILY_LIMIT = 25
 
 
 @dataclass(frozen=True)
@@ -99,45 +101,81 @@ class ChatService:
         )
         self.provider = provider or HostedProvider(config.llm_provider, config.llm_model,
                                                     config.llm_api_key, config.omniroute_base_url)
+        self._pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="chat-io")
 
-    def prepare(self, cookie: str, body: object):
-        conversation_id, message, history = validate_message(body)
-        key = context_key(self.config.hmac_secret, cookie, conversation_id)
-        if self.cache.rate(rate_key(self.config.hmac_secret, cookie, time.time())) > 20:
+    def _timed(self, timings: dict, name: str, fn, *args):
+        started = time.monotonic()
+        try:
+            return fn(*args)
+        finally:
+            timings[name] = int((time.monotonic() - started) * 1000)
+
+    def prepare(self, cookie: str, body: object, timings: dict | None = None):
+        timings = {} if timings is None else timings
+        _, message, history = validate_message(body)
+        # The snapshot is frozen per login session: only the first message of a session
+        # calls careerAPI (/me, /me/access, userContext). Later messages, in any chat,
+        # reuse it until it expires.
+        key = context_key(self.config.hmac_secret, cookie)
+        rate = self._pool.submit(self._timed, timings, "rate", self.cache.rate,
+                                 rate_key(self.config.hmac_secret, cookie, time.time()))
+        cached = self._pool.submit(self._timed, timings, "cache_get", self.cache.get, key)
+        if rate.result() > 20:
             raise ChatError(429, "rate_limited", "Too many messages. Please wait a minute.")
-        record = self.cache.get(key)
-        if record is None:
-            if history:
-                raise ChatError(409, "conversation_expired", "This chat has expired. Start a new chat.")
-            context = normalize_context(self.career_api.context(cookie))
-            record = {"context": context, "created_at": time.time()}
-            if not self.cache.put_first(key, record):
-                record = self.cache.get(key)
-                if record is None:
-                    raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
-                self.career_api.check_access(cookie)
-        else:
-            self.career_api.check_access(cookie)
-            if not self.cache.renew(key):
-                raise ChatError(409, "conversation_expired", "This chat has expired. Start a new chat.")
-        context = record.get("context") if isinstance(record, dict) else None
-        if not isinstance(context, dict):
-            raise ChatError(503, "cache_unavailable", "Chat memory is temporarily unavailable.")
+        record = cached.result()
+        if not (isinstance(record, dict) and isinstance(record.get("context"), dict)
+                and isinstance(record.get("student_id"), str)):
+            record = self._load_session(cookie, key, timings)
+        context = record["context"]
+        usage_key = daily_key(self.config.hmac_secret, record["student_id"], time.time())
+        used = self._timed(timings, "daily", self.cache.usage, usage_key)
+        # Checked before search and the model, which both spend quota.
+        if used >= DAILY_LIMIT:
+            raise ChatError(429, "daily_limit_reached",
+                            f"You've used all {DAILY_LIMIT} messages for today. Please come back tomorrow.")
         search_used = needs_search(message)
         evidence = []
         if search_used:
             if self.search is not None:
                 try:
-                    evidence = self.search.search(message)
+                    evidence = self._timed(timings, "search", self.search.search, message)
                 except ChatError:
                     pass
             if not evidence:
                 return iter((NO_CURRENT_FACTS,)), [], search_used
         prompt = system_prompt(context, evidence)
-        response = self.provider.open_stream(prompt, history, message)
+        response = self._timed(timings, "llm_open", self.provider.open_stream,
+                               prompt, history, message)
         sources = [{"title": item["title"], "url": item["url"], "date": item["date"]}
                    for item in evidence]
-        return self.provider.chunks(response), sources, search_used
+        return self._counted(self.provider.chunks(response), usage_key), sources, search_used
+
+    def _load_session(self, cookie: str, key: str, timings: dict) -> dict:
+        me = self._pool.submit(self._timed, timings, "me", self.career_api.student, cookie)
+        access = self._pool.submit(self._timed, timings, "access",
+                                   self.career_api.check_access, cookie)
+        # Read in a fixed order to keep 401 ahead of 402.
+        student = me.result()
+        access.result()
+        context = normalize_context(self._timed(timings, "user_context",
+                                                self.career_api.context_by_email,
+                                                student["email"]))
+        record = {"student_id": student["id"], "context": context, "created_at": time.time()}
+        self._timed(timings, "cache_put", self.cache.put, key, record)
+        return record
+
+    def _counted(self, chunks, usage_key: str):
+        """Yield the reply, then count it toward the daily cap.
+
+        Only a fully streamed reply is counted: a provider error or client disconnect
+        stops the generator before the increment. The canned no-facts reply is not
+        wrapped because it never reaches the model."""
+        yield from chunks
+        try:
+            self.cache.add_usage(usage_key)
+        except ChatError:
+            # The student already has the full answer; don't turn it into a stream error.
+            LOG.warning("daily usage increment failed")
 
 
 def json_response(status: int, body: dict):
@@ -150,19 +188,27 @@ def sse_event(name: str, data: dict) -> bytes:
     return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def stream_events(service: ChatService, chunks, sources, search_used, request_id, started):
+def format_timings(timings: dict) -> str:
+    return " ".join(f"{name}_ms={value}" for name, value in timings.items())
+
+
+def stream_events(service: ChatService, chunks, sources, search_used, request_id, started,
+                  timings: dict | None = None):
     """Yield SSE frames. Closing this generator (client disconnect) closes the model stream."""
+    timings = {} if timings is None else timings
     try:
         if sources:
             yield sse_event("sources", {"items": sources})
         for text in chunks:
+            timings.setdefault("first_token", int((time.monotonic() - started) * 1000))
             yield sse_event("delta", {"text": text})
         yield sse_event("done", {"finish_reason": "stop"})
-        LOG.info("request_id=%s status=200 provider=%s search=%s elapsed_ms=%d",
+        LOG.info("request_id=%s status=200 provider=%s search=%s elapsed_ms=%d %s",
                  request_id, service.config.llm_provider, search_used,
-                 int((time.monotonic() - started) * 1000))
+                 int((time.monotonic() - started) * 1000), format_timings(timings))
     except ChatError as error:
-        LOG.info("request_id=%s status=stream_error error=%s", request_id, error.code)
+        LOG.info("request_id=%s status=stream_error error=%s %s", request_id, error.code,
+                 format_timings(timings))
         yield sse_event("error", {"code": error.code, "message": str(error)})
     except Exception:
         LOG.error("request_id=%s status=stream_error error=stream_error", request_id)
@@ -183,6 +229,7 @@ def handle(service: ChatService, method: str, path: str, header, read):
         return json_response(404, {"error": {"code": "not_found", "message": "No such endpoint."}})
     request_id = uuid.uuid4().hex
     started = time.monotonic()
+    timings = {}
     try:
         origin = header("Origin")
         if origin and origin not in service.config.allowed_origins:
@@ -203,17 +250,18 @@ def handle(service: ChatService, method: str, path: str, header, read):
             body = json.loads(read(length))
         except (ValueError, UnicodeDecodeError):
             raise ChatError(400, "invalid_json", "Request body is not valid JSON.") from None
-        chunks, sources, search_used = service.prepare(cookie, body)
+        chunks, sources, search_used = service.prepare(cookie, body, timings)
     except ChatError as error:
-        LOG.info("request_id=%s status=%s error=%s elapsed_ms=%d", request_id, error.status,
-                 error.code, int((time.monotonic() - started) * 1000))
+        LOG.info("request_id=%s status=%s error=%s elapsed_ms=%d %s", request_id, error.status,
+                 error.code, int((time.monotonic() - started) * 1000), format_timings(timings))
         return json_response(error.status, {"error": {"code": error.code, "message": str(error)}})
     except Exception:
         LOG.error("request_id=%s status=500 error=server_error", request_id)
         return json_response(500, {"error": {"code": "server_error", "message": "Please try again."}})
     headers = [("Content-Type", "text/event-stream; charset=utf-8"),
                ("Cache-Control", "no-store, no-transform"), ("X-Accel-Buffering", "no")]
-    return 200, headers, stream_events(service, chunks, sources, search_used, request_id, started)
+    return 200, headers, stream_events(service, chunks, sources, search_used, request_id,
+                                       started, timings)
 
 
 def make_handler(service: ChatService):

@@ -1,6 +1,7 @@
 import io
 import json
 import threading
+import time
 import unittest
 import uuid
 from http.client import HTTPConnection
@@ -8,7 +9,7 @@ from http.server import ThreadingHTTPServer
 from dataclasses import replace
 from unittest.mock import patch
 
-from chatbot.core import (ChatError, context_key, get_session_cookie, needs_search,
+from chatbot.core import (ChatError, context_key, daily_key, get_session_cookie, needs_search,
                           normalize_context, safe_source, search_query, validate_message)
 from chatbot.providers import HostedProvider
 from chatbot.server import ChatService, Config, make_handler
@@ -18,15 +19,24 @@ from chatbot.verify_context import summarize
 
 class FakeCareerApi:
     def __init__(self):
+        self.me_calls = 0
         self.context_calls = 0
         self.access_calls = 0
         self.access = True
+        self.city = "Pune"
+
+    def student(self, cookie):
+        self.me_calls += 1
+        return {"id": f"id-{cookie}", "email": f"{cookie}@example.com"}
 
     def context(self, cookie):
+        return self.context_by_email(self.student(cookie)["email"])
+
+    def context_by_email(self, email):
         self.context_calls += 1
         return {"student": {"full_name": "Ananya Sharma", "email": "private@example.com",
                             "current_career": "Architect"},
-                "profile": {"class": 10, "city": "Pune", "hobbies": ["Drawing"]},
+                "profile": {"class": 10, "city": self.city, "hobbies": ["Drawing"]},
                 "latest_quiz": {"riasec_code": "AIC", "results": {
                     "stream_recommendation": "PCM", "top_careers": [
                         {"title": "Architect", "match_pct": 91, "email": "hidden@example.com"}]}}}
@@ -45,18 +55,18 @@ class FakeCache:
     def get(self, key):
         return self.values.get(key)
 
-    def put_first(self, key, value):
-        if key in self.values:
-            return False
+    def put(self, key, value):
         self.values[key] = value
-        return True
-
-    def renew(self, key):
-        return key in self.values
 
     def rate(self, key):
         self.counts[key] = self.counts.get(key, 0) + 1
         return self.counts[key]
+
+    def usage(self, key):
+        return self.counts.get(key, 0)
+
+    def add_usage(self, key):
+        self.counts[key] = self.counts.get(key, 0) + 1
 
 
 class FakeSearch:
@@ -173,16 +183,23 @@ class CoreTests(unittest.TestCase):
 
         cache = MemoryCache()
         with patch("chatbot.integrations.time.monotonic", return_value=100):
-            self.assertTrue(cache.put_first("profile", {"name": "Asha"}))
-            self.assertFalse(cache.put_first("profile", {"name": "Other"}))
+            cache.put("profile", {"name": "Asha"})
+            cache.put("profile", {"name": "Other"})
+            self.assertEqual(cache.get("profile"), {"name": "Other"})
             self.assertEqual(cache.rate("rate"), 1)
             self.assertEqual(cache.rate("rate"), 2)
         with patch("chatbot.integrations.time.monotonic", return_value=200):
-            self.assertTrue(cache.renew("profile"))
+            self.assertEqual(cache.get("profile"), {"name": "Other"})
         with patch("chatbot.integrations.time.monotonic", return_value=220):
             self.assertEqual(cache.rate("rate"), 1)
+            self.assertEqual(cache.usage("daily"), 0)
+            cache.add_usage("daily")
+            cache.add_usage("daily")
+            self.assertEqual(cache.usage("daily"), 2)
         with patch("chatbot.integrations.time.monotonic", return_value=86601):
             self.assertIsNone(cache.get("profile"))
+        with patch("chatbot.integrations.time.monotonic", return_value=220 + 172800):
+            self.assertEqual(cache.usage("daily"), 0)
 
     def test_external_contract_clients(self):
         seen = []
@@ -191,7 +208,7 @@ class CoreTests(unittest.TestCase):
             if url.endswith("me/access"):
                 return {"has_access": True}
             if url.endswith("/me"):
-                return {"student": {"email": "student@example.com"}}
+                return {"student": {"id": 7, "email": "student@example.com"}}
             if "userContext?email=" in url:
                 return {"email": "student@example.com", "profile": {"class": 10}}
             if url == "https://redis.example":
@@ -202,21 +219,23 @@ class CoreTests(unittest.TestCase):
         with patch("chatbot.integrations.json_request", side_effect=fake_request):
             api = CareerApi("https://api.example/", "service-token")
             self.assertEqual(api.context("token")["profile"]["class"], 10)
+            self.assertEqual(api.student("token"), {"id": "7", "email": "student@example.com"})
             api.check_access("token")
-            self.assertTrue(UpstashCache("https://redis.example", "secret").put_first("key", {"profile": {}}))
+            UpstashCache("https://redis.example", "secret").put("key", {"profile": {}})
             self.assertEqual(BraveSearch("key").search("Latest exam date?")[0]["date"], "2026-10-23")
         self.assertIn("Cookie", seen[0][1]["headers"])
         self.assertNotIn("Authorization", seen[0][1]["headers"])
         self.assertIn("Bearer", seen[2][1]["headers"]["Authorization"])
         self.assertIn("email=student%40example.com", seen[2][0])
-        self.assertEqual(seen[4][1]["body"][0], "SET")
+        self.assertEqual(seen[5][1]["body"][0], "SET")
+        self.assertEqual(seen[5][1]["body"][-2:], ["EX", 86400])
 
     def test_context_identity_and_paid_access_are_enforced(self):
         calls = []
         def mismatch(url, **kwargs):
             calls.append(url)
             if url.endswith("/me"):
-                return {"student": {"email": "student@example.com"}}
+                return {"student": {"id": 7, "email": "student@example.com"}}
             if url.endswith("/me/access"):
                 return {"has_access": True}
             return {"email": "other@example.com", "profile": None}
@@ -227,7 +246,7 @@ class CoreTests(unittest.TestCase):
         calls.clear()
         def unpaid(url, **kwargs):
             calls.append(url)
-            return {"student": {"email": "student@example.com"}} if url.endswith("/me") else {"has_access": False}
+            return {"student": {"id": 7, "email": "student@example.com"}} if url.endswith("/me") else {"has_access": False}
         with patch("chatbot.integrations.json_request", side_effect=unpaid):
             with self.assertRaises(ChatError) as caught:
                 CareerApi("https://api.example", "service-token").context("session")
@@ -249,16 +268,32 @@ class ServiceTests(unittest.TestCase):
         return self.service.prepare(cookie, {"conversation_id": self.cid, "message": message,
                                              "history": history or []})
 
-    def test_first_message_and_fixed_context(self):
+    HISTORY = [{"role": "user", "content": "What does an architect do?"},
+               {"role": "assistant", "content": "A useful answer."}]
+
+    def test_first_message_and_cached_followup(self):
         chunks, sources, searched = self.request()
         self.assertEqual(list(chunks), ["A useful answer."])
         self.assertFalse(searched)
-        self.assertEqual(self.api.context_calls, 1)
-        history = [{"role": "user", "content": "What does an architect do?"},
-                   {"role": "assistant", "content": "A useful answer."}]
-        self.request(message="How do I prepare?", history=history)
-        self.assertEqual(self.api.context_calls, 1)
-        self.assertEqual(self.api.access_calls, 1)
+        self.request(message="How do I prepare?", history=self.HISTORY)
+        # Only the session's first message calls careerAPI.
+        self.assertEqual((self.api.me_calls, self.api.access_calls, self.api.context_calls),
+                         (1, 1, 1))
+
+    def test_snapshot_is_frozen_for_the_session_across_new_chats(self):
+        self.request()
+        self.api.city = "Mumbai"
+        self.cid = str(uuid.uuid4())
+        self.request()
+        self.request(message="Follow-up", history=self.HISTORY)
+        self.assertEqual((self.api.me_calls, self.api.access_calls, self.api.context_calls),
+                         (1, 1, 1))
+        self.assertEqual(len(self.cache.values), 1)
+        self.assertIn("Pune", self.provider.calls[-1][0])
+        self.assertNotIn("Mumbai", self.provider.calls[-1][0])
+        # A new login session takes a fresh snapshot.
+        self.request(cookie="session-a2")
+        self.assertIn("Mumbai", self.provider.calls[-1][0])
 
     def test_search_sources_and_no_verification_fallback(self):
         chunks, sources, searched = self.request("Latest NATA exam date?")
@@ -271,19 +306,47 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("couldn't verify", next(chunks))
         self.assertEqual(self.provider.calls, [])
 
-    def test_eviction_and_lost_access(self):
+    def test_access_is_checked_once_per_session_snapshot(self):
         self.request()
         self.api.access = False
+        self.request(message="Follow-up", history=self.HISTORY)
         with self.assertRaisesRegex(ChatError, "active plan"):
-            self.request(message="Follow-up")
+            self.request(cookie="session-b")
+        # After the snapshot expires or is evicted, the next message checks again.
+        self.cache.values.pop(context_key(config().hmac_secret, "session-a"))
+        with self.assertRaisesRegex(ChatError, "active plan"):
+            self.request(message="Follow-up", history=self.HISTORY)
         self.api.access = True
-        key = context_key(config().hmac_secret, "session-a", self.cid)
-        self.cache.values.pop(key)
+        self.request(message="Follow-up", history=self.HISTORY)
+        self.assertEqual(self.api.context_calls, 2)
+
+    def test_daily_cap_counts_only_completed_model_replies(self):
+        usage_key = daily_key(config().hmac_secret, "id-session-a", time.time())
+        self.cache.rate = lambda key: 1  # keep the per-minute limit out of the way
+        # Unconsumed (cancelled) replies and the canned no-facts reply are not counted.
+        self.request()
+        self.search.results = []
+        self.assertIn("couldn't verify", next(self.request("Latest NATA exam date?")[0]))
+        self.assertEqual(self.cache.counts.get(usage_key, 0), 0)
+        for _ in range(25):
+            self.assertEqual(list(self.request()[0]), ["A useful answer."])
+        self.assertEqual(self.cache.counts[usage_key], 25)
+        calls = len(self.provider.calls)
         with self.assertRaises(ChatError) as caught:
-            self.request(history=[{"role": "user", "content": "Old"},
-                                  {"role": "assistant", "content": "Answer"}])
-        self.assertEqual(caught.exception.code, "conversation_expired")
-        self.assertEqual(self.api.context_calls, 1)
+            self.request()
+        self.assertEqual((caught.exception.status, caught.exception.code), (429, "daily_limit_reached"))
+        self.assertEqual(len(self.provider.calls), calls)
+        # The cap is per student, and a new IST day starts a fresh count.
+        self.assertEqual(list(self.request(cookie="session-b")[0]), ["A useful answer."])
+        with patch("chatbot.server.time.time", return_value=time.time() + 86400):
+            self.assertEqual(list(self.request()[0]), ["A useful answer."])
+
+    def test_daily_key_rolls_over_at_ist_midnight(self):
+        secret = config().hmac_secret
+        before = daily_key(secret, "7", 1792866599)  # 2026-10-24 23:59:59 IST
+        after = daily_key(secret, "7", 1792866600)   # 2026-10-25 00:00:00 IST
+        self.assertNotEqual(before, after)
+        self.assertEqual(before, daily_key(secret, "7", 1792780200))  # 2026-10-24 00:00:00 IST
 
     def test_users_and_conversations_are_isolated(self):
         self.request(cookie="session-a")
@@ -305,8 +368,7 @@ class ServiceTests(unittest.TestCase):
                               {"role": "assistant", "content": "A useful answer."}]
         request["message"] = "How should I prepare?"
         self.assertEqual(list(service.prepare("session-a", request)[0]), ["A useful answer."])
-        self.assertEqual(api.context_calls, 1)
-        self.assertEqual(api.access_calls, 1)
+        self.assertEqual((api.me_calls, api.access_calls, api.context_calls), (1, 1, 1))
         provider.calls.clear()
         request["message"] = "What is the latest exam date?"
         chunks, sources, searched = service.prepare("session-a", request)

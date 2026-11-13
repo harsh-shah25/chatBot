@@ -215,7 +215,7 @@ class TavilySearch:
                                 headers={"Authorization": f"Bearer {self.api_key}",
                                          "Content-Type": "application/json"},
                                 body={"query": query, "topic": "general",
-                                      "search_depth": "fast", "max_results": 5,
+                                      "search_depth": "basic", "max_results": 5,
                                       "include_answer": False,
                                       "include_raw_content": False,
                                       "country": "india", "include_usage": True,

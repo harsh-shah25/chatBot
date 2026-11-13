@@ -13,7 +13,7 @@ from chatbot.core import (ChatError, context_key, daily_key, get_session_cookie,
                           normalize_context, safe_source, search_query, validate_message)
 from chatbot.providers import HostedProvider
 from chatbot.server import ChatService, Config, make_handler
-from chatbot.integrations import BraveSearch, CareerApi, MemoryCache, UpstashCache
+from chatbot.integrations import CareerApi, MemoryCache, TavilySearch, UpstashCache
 from chatbot.verify_context import summarize
 
 
@@ -171,7 +171,7 @@ class CoreTests(unittest.TestCase):
         }
         with patch.dict("os.environ", required, clear=True):
             settings = Config.from_env()
-        self.assertEqual((settings.redis_url, settings.redis_token, settings.search_api_key),
+        self.assertEqual((settings.redis_url, settings.redis_token, settings.tavily_api_key),
                          ("", "", ""))
         with patch.dict("os.environ", {**required, "UPSTASH_REDIS_REST_URL": "https://redis.example"},
                         clear=True):
@@ -213,22 +213,28 @@ class CoreTests(unittest.TestCase):
                 return {"email": "student@example.com", "profile": {"class": 10}}
             if url == "https://redis.example":
                 return {"result": "OK"}
-            return {"grounding": {"generic": [{"url": "https://example.org/exam",
-                                                  "title": "Exam", "snippets": ["Current date"]}]},
-                    "sources": {"https://example.org/exam": {"age": ["", "2026-10-23"]}}}
+            return {"results": [{"url": "https://example.org/exam", "title": "Exam",
+                                 "content": "Current date", "published_date": "2026-10-23"}]}
         with patch("chatbot.integrations.json_request", side_effect=fake_request):
             api = CareerApi("https://api.example/", "service-token")
             self.assertEqual(api.context("token")["profile"]["class"], 10)
             self.assertEqual(api.student("token"), {"id": "7", "email": "student@example.com"})
             api.check_access("token")
-            UpstashCache("https://redis.example", "secret").put("key", {"profile": {}})
-            self.assertEqual(BraveSearch("key").search("Latest exam date?")[0]["date"], "2026-10-23")
+            self.assertTrue(UpstashCache("https://redis.example", "secret").put_first("key", {"profile": {}}))
+            self.assertEqual(TavilySearch("key").search("Latest exam date?")[0]["date"], "2026-10-23")
         self.assertIn("Cookie", seen[0][1]["headers"])
         self.assertNotIn("Authorization", seen[0][1]["headers"])
-        self.assertIn("Bearer", seen[2][1]["headers"]["Authorization"])
+        self.assertEqual(seen[2][1]["headers"]["Authorization"], "Bearer service-token")
         self.assertIn("email=student%40example.com", seen[2][0])
-        self.assertEqual(seen[5][1]["body"][0], "SET")
-        self.assertEqual(seen[5][1]["body"][-2:], ["EX", 86400])
+        self.assertEqual(seen[4][1]["body"][0], "SET")
+        self.assertEqual(seen[5][0], "https://api.tavily.com/search")
+        self.assertEqual(seen[5][1]["headers"]["Authorization"], "Bearer key")
+        self.assertEqual(seen[5][1]["body"]["query"], "Latest exam date?")
+        self.assertEqual(seen[5][1]["body"]["search_depth"], "fast")
+        self.assertEqual(seen[5][1]["body"]["max_results"], 5)
+        self.assertEqual(seen[5][1]["body"]["country"], "india")
+        self.assertTrue(seen[5][1]["body"]["include_usage"])
+        self.assertTrue(seen[5][1]["body"]["include_favicon"])
 
     def test_context_identity_and_paid_access_are_enforced(self):
         calls = []
@@ -357,7 +363,7 @@ class ServiceTests(unittest.TestCase):
     def test_optional_services_use_memory_and_skip_search(self):
         api = FakeCareerApi()
         provider = FakeProvider()
-        settings = replace(config(), redis_url="", redis_token="", search_api_key="")
+        settings = replace(config(), redis_url="", redis_token="", tavily_api_key="")
         service = ChatService(settings, career_api=api, provider=provider)
         self.assertIsInstance(service.cache, MemoryCache)
         self.assertIsNone(service.search)

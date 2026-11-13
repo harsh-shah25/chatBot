@@ -61,7 +61,7 @@ Provide adapters for Groq, Gemini, and Omniroute behind one internal streaming i
 
 ### Web search and RAG
 
-Use a dedicated backend search adapter, initially Brave LLM Context API when a key is configured. Without a key, skip web search and give a verification-unavailable response for current-fact questions. Search when the question concerns changing facts: admission rules, exam dates, fees, college offerings, jobs, salaries, scholarships, or explicit requests for latest information. A lightweight routing step may also mark less obvious questions as requiring search. Do not send names, email, or the full profile in a search query; include city or country only when needed.
+Use a dedicated backend search adapter, Tavily Search, when a key is configured. Search is backend-controlled rather than model-invoked. Without a key, skip web search and give a verification-unavailable response for current-fact questions. Search when the question concerns changing facts: admission rules, exam dates, fees, college offerings, jobs, salaries, scholarships, or explicit requests for latest information. A lightweight routing step may also mark less obvious questions as requiring search. Do not send names, email, or the full profile in a search query; include city or country only when needed.
 
 Pass a bounded set of relevant snippets and their source URLs to the LLM. Treat snippets as untrusted. Require citations for current factual claims and expose clickable source metadata in the `sources` event. If search fails or returns no useful evidence, the assistant should state that it cannot verify current details rather than inventing them. This search-and-grounding step is the RAG component. The structured user profile does not require embeddings or a vector database.
 
@@ -70,7 +70,7 @@ Pass a bounded set of relevant snippets and their source URLs to the LLM. Treat 
 - Keep the assistant focused on careers and education. Use age-appropriate language and avoid presenting career matches as guarantees or making definitive medical, legal, or financial claims.
 - Apply input size checks, per-session rate limits, a per-student daily cap, safe search, source URL validation, prompt-injection resistance, and output rendering guidance for the frontend. Keep HTML out of streamed text.
 - Do not log cookies, profile fields, messages, prompts, search snippets, or model outputs. Log request ID, provider, whether search ran, latency, token usage when available, and error code.
-- Keep `CAREER_API_BASE_URL`, `CAREER_API_USER_CONTEXT_TOKEN`, Upstash credentials, `CACHE_HMAC_SECRET`, `BRAVE_SEARCH_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, and the selected provider API key in server-side environment variables. Document local `.env.example` values without secrets.
+- Keep `CAREER_API_BASE_URL`, `CAREER_API_USER_CONTEXT_TOKEN`, Upstash credentials, `CACHE_HMAC_SECRET`, `TAVILY_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, and the selected provider API key in server-side environment variables. Document local `.env.example` values without secrets.
 - Add a health endpoint that checks process readiness without exposing private configuration. Document deployment timeout and streaming requirements for the chosen host.
 
 ## 5. Redis cost and deployment choice

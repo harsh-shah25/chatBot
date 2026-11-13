@@ -2,7 +2,7 @@
 
 ## Features
 
-The chatbot will answer career and education questions using the student's onboarding profile and career quiz results. When Brave is configured, it will search the web for current information and show clickable sources. Until then, it will say when it cannot verify a current fact. Replies will stream into the existing AI Chat UI in `careerAI/pages/app.html`.
+The chatbot will answer career and education questions using the student's onboarding profile and career quiz results. When Tavily is configured, the backend will search the web for current information and show clickable sources. Until then, it will say when it cannot verify a current fact. Replies will stream into the existing AI Chat UI in `careerAI/pages/app.html`.
 
 Chat messages will remain in browser memory for the current page session. Reloading, logging out, or selecting **Clear Chat** will clear them. No conversation transcripts will be saved across sessions.
 
@@ -28,7 +28,7 @@ The browser will send bounded recent chat turns with each request. `chatBot` wil
 
 ## Web search and RAG
 
-**When enabled, web search is the RAG component.** For questions requiring fresh facts, `chatBot` will retrieve relevant web content, pass it to the LLM as grounding material, and return source links with the answer. A dedicated search API keeps this behavior consistent across LLM providers.
+**When enabled, web search is the RAG component.** For questions requiring fresh facts, `chatBot` uses backend-controlled Tavily retrieval, passes bounded relevant web content to the LLM as grounding material, and returns source links with the answer. The model does not choose or directly invoke the search API; this keeps behavior and cost controls consistent across LLM providers.
 
 The structured student profile comes directly from `careerAPI`. It does **not** need embeddings or a vector database.
 

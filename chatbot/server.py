@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .core import (ChatError, context_key, daily_key, get_session_cookie, needs_search,
                    normalize_context, rate_key, system_prompt, validate_message)
-from .integrations import BraveSearch, CareerApi, MemoryCache, UpstashCache
+from .integrations import CareerApi, MemoryCache, TavilySearch, UpstashCache
 from .providers import HostedProvider
 
 
@@ -37,7 +37,7 @@ class Config:
     llm_model: str
     llm_api_key: str
     omniroute_base_url: str
-    search_api_key: str
+    tavily_api_key: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -72,7 +72,7 @@ class Config:
             hmac_secret=secret, llm_provider=provider,
             llm_model=required("LLM_MODEL"), llm_api_key=required(key_name),
             omniroute_base_url=base,
-            search_api_key=os.getenv("BRAVE_SEARCH_API_KEY", "").strip(),
+            tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
         )
 
 
@@ -97,7 +97,7 @@ class ChatService:
             if config.redis_url else MemoryCache()
         )
         self.search = search if search is not None else (
-            BraveSearch(config.search_api_key) if config.search_api_key else None
+            TavilySearch(config.tavily_api_key) if config.tavily_api_key else None
         )
         self.provider = provider or HostedProvider(config.llm_provider, config.llm_model,
                                                     config.llm_api_key, config.omniroute_base_url)

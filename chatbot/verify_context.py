@@ -1,4 +1,4 @@
-"""Check the live userContext endpoint without Redis, Brave, or an LLM.
+"""Check the live userContext endpoint without Redis, Tavily, or an LLM.
 
 Run: python -m chatbot.verify_context --email you@example.com
 """

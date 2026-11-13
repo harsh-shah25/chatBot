@@ -1,4 +1,4 @@
-"""careerAPI, Upstash Redis REST, and Brave Search clients."""
+"""careerAPI, Upstash Redis REST, and Tavily Search clients."""
 
 from __future__ import annotations
 
@@ -198,8 +198,10 @@ class UpstashCache:
         self.pipeline(["INCR", key], ["EXPIRE", key, 172800, "NX"])
 
 
-class BraveSearch:
-    ENDPOINT = "https://api.search.brave.com/res/v1/llm/context"
+class TavilySearch:
+    """Bounded Tavily retrieval for server-controlled web grounding."""
+
+    ENDPOINT = "https://api.tavily.com/search"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -210,30 +212,33 @@ class BraveSearch:
             return []
         try:
             data = json_request(self.ENDPOINT, method="POST", timeout=15,
-                                headers={"X-Subscription-Token": self.api_key,
+                                headers={"Authorization": f"Bearer {self.api_key}",
                                          "Content-Type": "application/json"},
-                                body={"q": query, "country": "IN", "safesearch": "strict",
-                                      "count": 8, "maximum_number_of_urls": 5,
-                                      "maximum_number_of_tokens": 2500,
-                                      "enable_source_metadata": True})
+                                body={"query": query, "topic": "general",
+                                      "search_depth": "fast", "max_results": 5,
+                                      "include_answer": False,
+                                      "include_raw_content": False,
+                                      "country": "india", "include_usage": True,
+                                      "include_favicon": True})
         except (HTTPError, ChatError) as error:
             raise ChatError(502, "search_unavailable", "Current information could not be checked.") from error
-        generic = data.get("grounding", {}).get("generic", []) if isinstance(data, dict) else []
-        sources = data.get("sources", {}) if isinstance(data, dict) else {}
         results = []
-        for item in generic[:5] if isinstance(generic, list) else []:
+        items = data.get("results", []) if isinstance(data, dict) else []
+        for item in items[:5] if isinstance(items, list) else []:
             if not isinstance(item, dict):
                 continue
             url = safe_source(item.get("url"))
-            snippets = item.get("snippets")
-            if not url or not isinstance(snippets, list):
+            content = item.get("content")
+            if not url or not isinstance(content, str):
                 continue
-            snippet = " ".join(str(s) for s in snippets[:3])[:1800]
+            snippet = " ".join(content.split())[:1800]
             if not snippet:
                 continue
-            meta = sources.get(item["url"], {}) if isinstance(sources, dict) else {}
-            age = meta.get("age", []) if isinstance(meta, dict) else []
-            date = age[1] if isinstance(age, list) and len(age) > 1 and isinstance(age[1], str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", age[1]) else None
-            results.append({"title": str(item.get("title") or meta.get("title") or url)[:150],
+            date = item.get("published_date")
+            if isinstance(date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T.*)?", date):
+                date = date[:10]
+            else:
+                date = None
+            results.append({"title": str(item.get("title") or url)[:150],
                             "url": url, "date": date, "snippet": snippet})
         return results

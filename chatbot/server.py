@@ -139,8 +139,8 @@ class ChatService:
             if self.search is not None:
                 try:
                     evidence = self._timed(timings, "search", self.search.search, message)
-                except ChatError:
-                    pass
+                except ChatError as error:
+                    LOG.warning("search failed: %r", error.__cause__ or error)
             if not evidence:
                 return iter((NO_CURRENT_FACTS,)), [], search_used
         prompt = system_prompt(context, evidence)

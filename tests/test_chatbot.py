@@ -29,14 +29,15 @@ class FakeCareerApi:
 
     def student(self, cookie):
         self.me_calls += 1
-        return {"id": f"id-{cookie}", "email": f"{cookie}@example.com"}
+        return {"id": f"id-{cookie}", "username": f"student.{cookie}"}
 
     def context(self, cookie):
-        return self.context_by_email(self.student(cookie)["email"])
+        return self.context_by_username(self.student(cookie)["username"])
 
-    def context_by_email(self, email):
+    def context_by_username(self, username):
         self.context_calls += 1
-        return {"student": {"full_name": "Ananya Sharma", "email": "private@example.com",
+        return {"username": username, "phone_no": "9876543210",
+                "student": {"full_name": "Ananya Sharma", "email": "private@example.com",
                             "current_career": "Architect"},
                 "profile": ({"class": 10} if self.incomplete
                             else {**COMPLETE_PROFILE, "city": self.city, "hobbies": ["Drawing"]}),
@@ -124,6 +125,8 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("Sharma", text)
         self.assertNotIn("private@example.com", text)
         self.assertNotIn("hidden@example.com", text)
+        self.assertNotIn("student.session", text)
+        self.assertNotIn("9876543210", text)
 
     def test_actual_user_context_shape_with_null_profile(self):
         raw = {"email": "student@example.com", "full_name": "Asha Rao", "profile": None,
@@ -226,9 +229,9 @@ class CoreTests(unittest.TestCase):
             if url.endswith("me/access"):
                 return {"has_access": True}
             if url.endswith("/me"):
-                return {"student": {"id": 7, "email": "student@example.com"}}
-            if "userContext?email=" in url:
-                return {"email": "student@example.com", "profile": {"class": 10}}
+                return {"student": {"id": 7, "username": "asha.r", "email": None}}
+            if "userContext?username=" in url:
+                return {"username": "asha.r", "email": None, "profile": {"class": 10}}
             if url == "https://redis.example":
                 return {"result": "OK"}
             return {"results": [{"url": "https://example.org/exam", "title": "Exam",
@@ -236,14 +239,14 @@ class CoreTests(unittest.TestCase):
         with patch("chatbot.integrations.json_request", side_effect=fake_request):
             api = CareerApi("https://api.example/", "service-token")
             self.assertEqual(api.context("token")["profile"]["class"], 10)
-            self.assertEqual(api.student("token"), {"id": "7", "email": "student@example.com"})
+            self.assertEqual(api.student("token"), {"id": "7", "username": "asha.r"})
             api.check_access("token")
             UpstashCache("https://redis.example", "secret").put("key", {"profile": {}})
             self.assertEqual(TavilySearch("key").search("Latest exam date?")[0]["date"], "2026-10-23")
         self.assertIn("Cookie", seen[0][1]["headers"])
         self.assertNotIn("Authorization", seen[0][1]["headers"])
         self.assertEqual(seen[2][1]["headers"]["Authorization"], "Bearer service-token")
-        self.assertIn("email=student%40example.com", seen[2][0])
+        self.assertIn("username=asha.r", seen[2][0])
         self.assertEqual(seen[5][1]["body"][0], "SET")
         self.assertEqual(seen[6][0], "https://api.tavily.com/search")
         self.assertEqual(seen[6][1]["headers"]["Authorization"], "Bearer key")
@@ -259,10 +262,10 @@ class CoreTests(unittest.TestCase):
         def mismatch(url, **kwargs):
             calls.append(url)
             if url.endswith("/me"):
-                return {"student": {"id": 7, "email": "student@example.com"}}
+                return {"student": {"id": 7, "username": "asha.r", "email": None}}
             if url.endswith("/me/access"):
                 return {"has_access": True}
-            return {"email": "other@example.com", "profile": None}
+            return {"username": "someone.else", "profile": None}
         with patch("chatbot.integrations.json_request", side_effect=mismatch):
             with self.assertRaises(ChatError) as caught:
                 CareerApi("https://api.example", "service-token").context("session")
@@ -270,7 +273,7 @@ class CoreTests(unittest.TestCase):
         calls.clear()
         def unpaid(url, **kwargs):
             calls.append(url)
-            return {"student": {"id": 7, "email": "student@example.com"}} if url.endswith("/me") else {"has_access": False}
+            return {"student": {"id": 7, "username": "asha.r", "email": None}} if url.endswith("/me") else {"has_access": False}
         with patch("chatbot.integrations.json_request", side_effect=unpaid):
             with self.assertRaises(ChatError) as caught:
                 CareerApi("https://api.example", "service-token").context("session")

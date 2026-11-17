@@ -166,8 +166,8 @@ class ChatService:
         student = me.result()
         access.result()
         context = normalize_context(self._timed(timings, "user_context",
-                                                self.career_api.context_by_email,
-                                                student["email"]))
+                                                self.career_api.context_by_username,
+                                                student["username"]))
         record = {"student_id": student["id"], "context": context, "created_at": time.time()}
         # An incomplete profile is not cached, so the first message after onboarding re-fetches.
         if not profile_missing(context):

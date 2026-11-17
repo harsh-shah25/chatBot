@@ -52,27 +52,30 @@ class CareerApi:
         return result
 
     def student(self, cookie: str) -> dict:
-        """The logged-in student's id and email, from GET /me."""
+        """The logged-in student's id and username, from GET /me.
+
+        Username, not email: students log in with a username, email is optional,
+        and siblings may share one."""
         student = self._get("me", cookie=cookie).get("student")
         student = student if isinstance(student, dict) else {}
-        email = student.get("email")
-        if student.get("id") is None or not isinstance(email, str) or not email.strip():
+        username = student.get("username")
+        if student.get("id") is None or not isinstance(username, str) or not username.strip():
             raise ChatError(502, "invalid_student", "Could not identify your account.")
-        return {"id": str(student["id"]), "email": email}
+        return {"id": str(student["id"]), "username": username}
 
     def context(self, cookie: str) -> dict:
-        email = self.student(cookie)["email"]
+        username = self.student(cookie)["username"]
         self.check_access(cookie)
-        return self.context_by_email(email)
+        return self.context_by_username(username)
 
-    def context_by_email(self, email: str) -> dict:
-        """Service-only lookup; pass only an email that came from the caller's own /me."""
-        if not isinstance(email, str) or not email.strip():
-            raise ChatError(400, "invalid_email", "An email is required for this check.")
-        path = "userContext?" + urlencode({"email": email.strip()})
+    def context_by_username(self, username: str) -> dict:
+        """Service-only lookup; pass only a username that came from the caller's own /me."""
+        if not isinstance(username, str) or not username.strip():
+            raise ChatError(400, "invalid_username", "A username is required for this check.")
+        path = "userContext?" + urlencode({"username": username.strip()})
         context = self._get(path, bearer=self.user_context_token)
-        returned_email = context.get("email")
-        if not isinstance(returned_email, str) or returned_email.casefold() != email.strip().casefold():
+        returned = context.get("username")
+        if not isinstance(returned, str) or returned.casefold() != username.strip().casefold():
             raise ChatError(502, "invalid_context", "careerAPI returned the wrong student profile.")
         return context
 

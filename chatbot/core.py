@@ -14,10 +14,11 @@ from urllib.parse import unquote, urlsplit
 
 
 class ChatError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str, *, extra: dict | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.extra = extra or {}
 
 
 def validate_message(body: object) -> tuple[str, str, list[dict[str, str]]]:
@@ -138,6 +139,20 @@ def normalize_context(raw: object) -> dict:
     if len(json.dumps(context, ensure_ascii=False)) > 16000:
         raise ChatError(502, "invalid_context", "The profile response is too large.")
     return context
+
+
+# Onboarding answers a student must give before chatting. dream_job and
+# career_preference are optional; completed_at is set by careerAPI.
+REQUIRED_PROFILE_FIELDS = ("class", "board", "medium", "city", "marks",
+                           "favourite_subjects", "hobbies", "study_location")
+
+
+def profile_missing(context: dict) -> list[str]:
+    """Required profile fields that are absent, null, blank, or an empty mark sheet/list."""
+    profile = _obj(_obj(context).get("profile"))
+    def empty(value):
+        return value is None or value == {} or value == [] or (isinstance(value, str) and not value.strip())
+    return [name for name in REQUIRED_PROFILE_FIELDS if empty(profile.get(name))]
 
 
 FRESH_PATTERN = re.compile(

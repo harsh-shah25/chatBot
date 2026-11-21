@@ -13,8 +13,8 @@ The backend must not save conversation transcripts across page sessions. The fro
 ### Authentication and profile
 
 - The frontend calls the chat service through a first-party `/chat/*` proxy that forwards the existing `careerai_session` cookie. Direct cross-site calls are not assumed to carry this cookie. The frontend developer owns the proxy and its deployment configuration.
-- On the first message of a login session, `chatBot` calls `GET /me` with the forwarded cookie to get the authenticated email, then `GET /me/access` to confirm paid access. It calls `GET /userContext?email=<encoded authenticated email>` with a server-side bearer token. The email is never taken from the chat request. A 401 or unpaid result prevents an LLM call.
-- The returned JSON is a fixed snapshot for the login session. Include first name, available onboarding details, useful `top_careers` fields, and summaries of recent attempted `contest_scores`. The profile may be null. Exclude email, full name, school identifiers, static salary estimates, contest IDs and timestamps, and raw quiz answers from the LLM prompt. Verify that the returned email matches the authenticated student.
+- On the first message of a login session, `chatBot` calls `GET /me` with the forwarded cookie to get the authenticated username, then `GET /me/access` to confirm paid access. It calls `GET /userContext?username=<encoded authenticated username>` with a server-side bearer token. The username is never taken from the chat request. A 401 or unpaid result prevents an LLM call.
+- The returned JSON is a fixed snapshot for the login session. Include first name, available onboarding details, useful `top_careers` fields, and summaries of recent attempted `contest_scores`. The profile may be null. Exclude username, email, phone, full name, institute identifiers, static salary estimates, contest IDs and timestamps, and raw quiz answers from the LLM prompt. Verify that the returned username matches the authenticated student.
 - Later messages in the session, including new conversations, reuse the cached snapshot and make no careerAPI calls. Lost access, logout, or a profile edit takes effect when the snapshot expires or the student logs in again.
 
 ### Chat HTTP API
@@ -41,7 +41,7 @@ Return `Content-Type: text/event-stream` from the POST request. Use these event 
 - `done`: JSON `{ "finish_reason": "stop" }` when the answer is complete.
 - `error`: JSON `{ "code": "...", "message": "..." }` if an error occurs after streaming starts.
 
-Before the stream starts, use JSON errors with HTTP 400, 401, 402, 429, 502, or 503 as appropriate. A 429 has code `rate_limited` (more than 20 messages a minute from one session) or `daily_limit_reached` (the student already has 25 completed replies today; resets at midnight IST). The frontend should add a turn to its history only after `done`. It should allow cancelling the request and discard an incomplete assistant turn. The frontend developer owns this behavior.
+Before the stream starts, use JSON errors with HTTP 400, 401, 402, 403, 429, 502, or 503 as appropriate. A 403 with code `profile_incomplete` means a required onboarding answer is empty (`class`, `board`, `medium`, `city`, `marks`, `favourite_subjects`, `hobbies`, `study_location`; `dream_job` and `career_preference` are optional); the error object also carries `missing`, the empty fields in that order. Such a message reaches neither search nor the model, is not counted, and the incomplete snapshot is not cached. A 429 has code `rate_limited` (more than 20 messages a minute from one session) or `daily_limit_reached` (the student already has 25 completed replies today; resets at midnight IST). The frontend should add a turn to its history only after `done`. It should allow cancelling the request and discard an incomplete assistant turn. The frontend developer owns this behavior.
 
 ## 3. Backend architecture and request flow
 
@@ -49,7 +49,7 @@ Use Python 3.12+ and its standard library HTTP server with modules for request v
 
 1. Validate the request, allowed Origin, cookie, conversation ID, message, and history.
 2. Derive a cache key from an HMAC of the session cookie plus conversation ID. Never store or log the raw cookie. Use a server secret for the HMAC.
-3. Look up the snapshot by an HMAC of the session cookie. If it is missing, resolve the student's ID and email through `/me`, check `/me/access`, fetch `/userContext` with the service bearer token, normalise it, and write it with the student ID to the selected cache. Otherwise use the cached snapshot without calling careerAPI.
+3. Look up the snapshot by an HMAC of the session cookie. If it is missing, resolve the student's ID and username through `/me`, check `/me/access`, fetch `/userContext` with the service bearer token, normalise it, and write it with the student ID to the selected cache. Otherwise use the cached snapshot without calling careerAPI.
 4. Build the LLM request from server-owned instructions, the structured profile snapshot, validated recent turns, the new message, and any retrieved web evidence. Profile values and web content are data, not instructions.
 5. Stream the answer. Send source metadata only for URLs actually returned by the search service. End with `done` or `error`.
 

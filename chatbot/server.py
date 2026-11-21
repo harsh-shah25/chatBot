@@ -13,7 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .core import (ChatError, context_key, daily_key, get_session_cookie, needs_search,
-                   normalize_context, rate_key, system_prompt, validate_message)
+                   normalize_context, profile_missing, rate_key, system_prompt,
+                   validate_message)
 from .integrations import CareerApi, MemoryCache, TavilySearch, UpstashCache
 from .providers import HostedProvider
 
@@ -126,7 +127,14 @@ class ChatService:
         if not (isinstance(record, dict) and isinstance(record.get("context"), dict)
                 and isinstance(record.get("student_id"), str)):
             record = self._load_session(cookie, key, timings)
+        elif profile_missing(record["context"]):
+            # Cached before the profile gate existed; the student may have finished onboarding since.
+            record = self._load_session(cookie, key, timings)
         context = record["context"]
+        missing = profile_missing(context)
+        if missing:
+            raise ChatError(403, "profile_incomplete", "Complete your profile to start chatting.",
+                            extra={"missing": missing})
         usage_key = daily_key(self.config.hmac_secret, record["student_id"], time.time())
         used = self._timed(timings, "daily", self.cache.usage, usage_key)
         # Checked before search and the model, which both spend quota.
@@ -158,10 +166,12 @@ class ChatService:
         student = me.result()
         access.result()
         context = normalize_context(self._timed(timings, "user_context",
-                                                self.career_api.context_by_email,
-                                                student["email"]))
+                                                self.career_api.context_by_username,
+                                                student["username"]))
         record = {"student_id": student["id"], "context": context, "created_at": time.time()}
-        self._timed(timings, "cache_put", self.cache.put, key, record)
+        # An incomplete profile is not cached, so the first message after onboarding re-fetches.
+        if not profile_missing(context):
+            self._timed(timings, "cache_put", self.cache.put, key, record)
         return record
 
     def _counted(self, chunks, usage_key: str):
@@ -254,7 +264,8 @@ def handle(service: ChatService, method: str, path: str, header, read):
     except ChatError as error:
         LOG.info("request_id=%s status=%s error=%s elapsed_ms=%d %s", request_id, error.status,
                  error.code, int((time.monotonic() - started) * 1000), format_timings(timings))
-        return json_response(error.status, {"error": {"code": error.code, "message": str(error)}})
+        return json_response(error.status, {"error": {"code": error.code, "message": str(error),
+                                                      **error.extra}})
     except Exception:
         LOG.error("request_id=%s status=500 error=server_error", request_id)
         return json_response(500, {"error": {"code": "server_error", "message": "Please try again."}})

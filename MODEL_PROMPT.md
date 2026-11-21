@@ -12,6 +12,8 @@ The student, chat history, and Tavily results are **made-up sample data**. Every
 1. The student context is loaded (from the Redis snapshot, or careerAPI on the first message)
    and filtered through `normalize_context()`. Only whitelisted fields get through (first name,
    current career, profile, quiz assessment, last 3 attempted contests). Email, surname and raw quiz answers are dropped.
+   If a required profile field is empty (everything except `dream_job` and `career_preference`),
+   the request stops here with HTTP 403 `profile_incomplete`: **no prompt is built and the model is not called.**
 2. `needs_search(message)` checks **only the current message** against:
    `\b(latest|current|today|this year|20(?:2[4-9]|3\d)|deadline|date)\b` (case-insensitive).
 3. **No match → Path A** (no web search).

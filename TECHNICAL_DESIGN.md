@@ -18,7 +18,7 @@ flowchart LR
     Bot -->|Stream reply and sources| UI
 ```
 
-`chatBot` uses the student's forwarded session cookie to call `GET /me` and `GET /me/access`. It obtains the authenticated email from `/me`, then calls `GET /userContext?email=<encoded email>` with a server-side bearer token. It checks that the returned email matches. The response may include a null profile, root-level career matches, and contest scores. Only guidance data enters the LLM context; email, full name, static salary estimates, contest IDs, and timestamps stay out.
+`chatBot` uses the student's forwarded session cookie to call `GET /me` and `GET /me/access`. It obtains the authenticated username from `/me`, then calls `GET /userContext?username=<encoded username>` with a server-side bearer token. It checks that the returned username matches. The response may include a null profile, root-level career matches, and contest scores. Only guidance data enters the LLM context; username, email, phone, full name, static salary estimates, contest IDs, and timestamps stay out.
 
 On the **first message of each login session**, `chatBot` fetches `userContext` and stores that snapshot in the selected cache: **process-local memory by default**, or a separate managed Upstash Redis service when configured. The cache key is an HMAC of the session cookie, so each login session has **one snapshot**, however many chats it opens. Upstash is optional; the profile will not be stored in the frontend.
 

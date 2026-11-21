@@ -1,6 +1,6 @@
 """Check the live userContext endpoint without Redis, Tavily, or an LLM.
 
-Run: python -m chatbot.verify_context --email you@example.com
+Run: python -m chatbot.verify_context --username your.username
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def summarize(raw: dict, context: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify the live careerAPI userContext response")
-    parser.add_argument("--email", required=True, help="Email of the student to verify")
+    parser.add_argument("--username", required=True, help="Username of the student to verify")
     args = parser.parse_args()
     load_dotenv()
     base = os.getenv("CAREER_API_BASE_URL", "").strip()
@@ -39,7 +39,7 @@ def main() -> int:
         print("Missing CAREER_API_BASE_URL or CAREER_API_USER_CONTEXT_TOKEN in .env")
         return 2
     try:
-        raw = CareerApi(base, token).context_by_email(args.email)
+        raw = CareerApi(base, token).context_by_username(args.username)
         context = normalize_context(raw)
     except ChatError as error:
         print(json.dumps({"endpoint_reached": False, "error": error.code,

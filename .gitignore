@@ -6,3 +6,8 @@ __pycache__/
 .env*
 !.env.example
 .venv/
+
+# Markdown docs live in D:\Crackeer, not with the code (README and licence files excepted)
+*.md
+!README.md
+!LICENSE*.md
